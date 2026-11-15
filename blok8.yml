@@ -1,0 +1,1472 @@
+name: Blok APK 8
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK hazirla
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'BLOK_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.blok.yardimci"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.blok.yardimci6"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 8
+                  versionName = "8"
+              }
+
+              signingConfigs {
+                  create("fixed") {
+                      storeFile = file("debug.keystore")
+                      storeType = "pkcs12"
+                      storePassword = "blokyardimci"
+                      keyAlias = "blok"
+                      keyPassword = "blokyardimci"
+                  }
+              }
+
+              buildTypes {
+                  getByName("debug") {
+                      signingConfig = signingConfigs.getByName("fixed")
+                  }
+                  getByName("release") {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'BLOK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Blok Yardımcısı 8"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".AutoTapService"
+                      android:exported="true"
+                      android:label="Blok Yardımcısı 8 otomatik dokunma"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/Analyzer.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          import java.nio.ByteBuffer
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          class Frame(
+              private val buf: ByteBuffer,
+              private val rs: Int,
+              private val ps: Int,
+              val w: Int,
+              val h: Int
+          ) {
+              fun r(x: Int, y: Int): Int = buf.get(y * rs + x * ps).toInt() and 0xFF
+              fun g(x: Int, y: Int): Int = buf.get(y * rs + x * ps + 1).toInt() and 0xFF
+              fun b(x: Int, y: Int): Int = buf.get(y * rs + x * ps + 2).toInt() and 0xFF
+          }
+
+          /**
+           * Ekran görüntüsünden 8x8 tahtayı ve alttaki 3 parçayı okur.
+           * Koordinatlar 1080 piksel genişlikteki referans yerleşime göredir, ekrana oranlanır.
+           */
+          class Analyzer {
+              companion object {
+                  const val P = 118.6
+                  const val CX0 = 125.0
+                  const val CY0 = 975.0
+              }
+
+              var dx = 0.0
+              var dy = 0.0
+              var s = 1.0
+              private var qCount = 0
+              private lateinit var f: Frame
+              private val tmp = IntArray(3)
+
+              private fun cx(c: Int) = (CX0 + dx + P * c) * s
+              private fun cy(r: Int) = (CY0 + dy + P * r) * s
+
+              private fun avg(x: Double, y: Double, rad: Int): IntArray {
+                  var rr = 0
+                  var gg = 0
+                  var bb = 0
+                  var n = 0
+                  var j = -rad
+                  while (j <= rad) {
+                      var i = -rad
+                      while (i <= rad) {
+                          val xx = min(f.w - 1, max(0, (x + i).roundToInt()))
+                          val yy = min(f.h - 1, max(0, (y + j).roundToInt()))
+                          rr += f.r(xx, yy)
+                          gg += f.g(xx, yy)
+                          bb += f.b(xx, yy)
+                          n++
+                          i += 2
+                      }
+                      j += 2
+                  }
+                  tmp[0] = rr / n
+                  tmp[1] = gg / n
+                  tmp[2] = bb / n
+                  return tmp
+              }
+
+              private fun mx(c: IntArray): Int = max(c[0], max(c[1], c[2]))
+
+              private fun filled(c: IntArray): Boolean {
+                  val m = mx(c)
+                  val n = min(c[0], min(c[1], c[2]))
+                  return m / 255.0 > 0.58 && (m - n).toDouble() / m > 0.3
+              }
+
+              private fun bright(x: Int, y: Int): Boolean {
+                  if (x < 0 || y < 0 || x >= f.w || y >= f.h) return false
+                  val r = f.r(x, y)
+                  val g = f.g(x, y)
+                  val b = f.b(x, y)
+                  val m = max(r, max(g, b))
+                  val n = min(r, min(g, b))
+                  return m > 153 && (m - n).toDouble() / m > 0.4
+              }
+
+              /** Izgara doğru hizalıysa yüksek değer verir; qCount = belirgin hücre sayısı (64 üzerinden). */
+              private fun quality(): Double {
+                  var sum = 0.0
+                  var cnt = 0
+                  val half = P * s / 2
+                  for (r in 0..7) {
+                      for (c in 0..7) {
+                          val x = cx(c)
+                          val y = cy(r)
+                          val m = mx(avg(x, y, 2))
+                          val gv = mx(avg(x, if (r < 7) y + half else y - half, 1))
+                          val gh = mx(avg(if (c < 7) x + half else x - half, y, 1))
+                          val d = m - max(gv, gh)
+                          if (d > 25) cnt++
+                          sum += d.coerceIn(-30, 60)
+                      }
+                  }
+                  qCount = cnt
+                  return sum
+              }
+
+              private fun fit(): Boolean {
+                  var bx = 0.0
+                  var by = 0.0
+                  var bs = -1e18
+                  var a = -40
+                  while (a <= 40) {
+                      var b = -250
+                      while (b <= 250) {
+                          dx = a.toDouble()
+                          dy = b.toDouble()
+                          val q = quality()
+                          if (q > bs) {
+                              bs = q
+                              bx = dx
+                              by = dy
+                          }
+                          b += 6
+                      }
+                      a += 6
+                  }
+                  val cx0 = bx
+                  val cy0 = by
+                  bs = -1e18
+                  for (a2 in -5..5) {
+                      for (b2 in -5..5) {
+                          dx = cx0 + a2
+                          dy = cy0 + b2
+                          val q = quality()
+                          if (q > bs) {
+                              bs = q
+                              bx = dx
+                              by = dy
+                          }
+                      }
+                  }
+                  dx = bx
+                  dy = by
+                  quality()
+                  return qCount >= 58
+              }
+
+              /** [start, end] aralıklarını döner: eşiği geçen ardışık bölgeler, kısa boşluklar birleştirilir, kısa bölgeler atılır. */
+              private fun segments(v: IntArray, thr: Int, gapMin: Int, lenMin: Int): List<IntArray> {
+                  val out = ArrayList<IntArray>()
+                  var st = -1
+                  var last = -1
+                  for (k in v.indices) {
+                      if (v[k] >= thr) {
+                          if (st < 0) st = k
+                          last = k
+                      } else if (st >= 0 && k - last >= gapMin) {
+                          out.add(intArrayOf(st, last))
+                          st = -1
+                      }
+                  }
+                  if (st >= 0) out.add(intArrayOf(st, last))
+                  return out.filter { it[1] - it[0] + 1 >= lenMin }
+              }
+
+              /**
+               * Tepsideki bir parçayı okur. Hücre boyutunu tahmin etmez: parlak piksellerin
+               * sütun ve satır izdüşümlerindeki boşluklardan hücre sınırlarını bulur.
+               * Hızlı olması için her iki yönde de 2 pikselde bir örnekler.
+               */
+              private fun readPiece(i: Int): Piece? {
+                  val x0 = ((85 + 315 * i + dx) * s).roundToInt().coerceAtLeast(0)
+                  val x1 = min(f.w, (x0 + 283 * s).roundToInt())
+                  val y0 = ((CY0 + dy + 950) * s).roundToInt().coerceAtLeast(0)
+                  val y1 = min(f.h, ((CY0 + dy + 1152) * s).roundToInt())
+                  val nx = (x1 - x0) / 2
+                  val ny = (y1 - y0) / 2
+                  if (nx < 10 || ny < 10) return null
+                  val colCnt = IntArray(nx)
+                  val rowCnt = IntArray(ny)
+                  for (ky in 0 until ny) {
+                      val y = y0 + ky * 2
+                      for (kx in 0 until nx) {
+                          if (bright(x0 + kx * 2, y)) {
+                              colCnt[kx]++
+                              rowCnt[ky]++
+                          }
+                      }
+                  }
+                  val gapMin = max(2, (3 * s).roundToInt())
+                  val lenMin = max(6, (10 * s).roundToInt())
+                  val cs = segments(colCnt, max(2, (3 * s).roundToInt()), gapMin, lenMin)
+                  val rs = segments(rowCnt, max(5, (10 * s).roundToInt()), gapMin, lenMin)
+                  if (cs.isEmpty() || rs.isEmpty() || cs.size > 5 || rs.size > 5) return null
+                  val rows = IntArray(rs.size)
+                  var any = false
+                  val bcx = x0 + (cs[0][0] + cs[cs.size - 1][1]).toDouble()
+                  val bcy = y0 + (rs[0][0] + rs[rs.size - 1][1]).toDouble()
+                  var bestD = 1e18
+                  var gi = 0
+                  var gj = 0
+                  var gx = bcx
+                  var gy = bcy
+                  for (ri in rs.indices) {
+                      for (ci in cs.indices) {
+                          val cxp = x0 + (cs[ci][0] + cs[ci][1]).toDouble()
+                          val cyp = y0 + (rs[ri][0] + rs[ri][1]).toDouble()
+                          if (filled(avg(cxp, cyp, max(2, (5 * s).roundToInt())))) {
+                              rows[ri] = rows[ri] or (1 shl ci)
+                              any = true
+                              val d = (cxp - bcx) * (cxp - bcx) + (cyp - bcy) * (cyp - bcy)
+                              if (d < bestD) {
+                                  bestD = d
+                                  gi = ri
+                                  gj = ci
+                                  gx = cxp
+                                  gy = cyp
+                              }
+                          }
+                      }
+                  }
+                  if (!any) return null
+                  return Piece(i, rs.size, cs.size, rows, gx, gy, gi, gj)
+              }
+
+              private fun q(x: Int, y: Int): Long {
+                  val xx = min(f.w - 1, max(0, x))
+                  val yy = min(f.h - 1, max(0, y))
+                  return (((f.r(xx, yy) shr 4) shl 8) or ((f.g(xx, yy) shr 4) shl 4) or (f.b(xx, yy) shr 4)).toLong()
+              }
+
+              /** Tahta hücre merkezlerinden ve tepsiden seyrek örnek alıp özet üretir. Ekran değişmediyse aynı çıkar. */
+              fun quickHash(frame: Frame): Long {
+                  f = frame
+                  s = frame.w / 1080.0
+                  var hsh = -3750763034362895579L
+                  for (r in 0..7) {
+                      for (c in 0..7) {
+                          hsh = (hsh xor q(cx(c).roundToInt(), cy(r).roundToInt())) * 1099511628211L
+                      }
+                  }
+                  val step = max(6, (14 * s).roundToInt())
+                  for (i in 0..2) {
+                      val x0 = ((85 + 315 * i + dx) * s).roundToInt()
+                      val x1 = (x0 + 283 * s).roundToInt()
+                      val y0 = ((CY0 + dy + 950) * s).roundToInt()
+                      val y1 = ((CY0 + dy + 1152) * s).roundToInt()
+                      var y = y0
+                      while (y < y1) {
+                          var x = x0
+                          while (x < x1) {
+                              hsh = (hsh xor q(x, y)) * 1099511628211L
+                              x += step
+                          }
+                          y += step
+                      }
+                  }
+                  return hsh
+              }
+
+              /** [segs] içinden toplam yoğunluğu en büyük olan aralığı seçer (tek tük gürültü pikselleri elenir). */
+              private fun bestSeg(v: IntArray, segs: List<IntArray>): IntArray? {
+                  var b: IntArray? = null
+                  var bs = -1
+                  for (g in segs) {
+                      var t = 0
+                      for (k in g[0]..g[1]) t += v[k]
+                      if (t > bs) {
+                          bs = t
+                          b = g
+                      }
+                  }
+                  return b
+              }
+
+              /**
+               * Sürükleme sırasında ELDEKİ (kalkmış) parçanın ekrandaki gerçek yerini bulur.
+               * Sürükleme öncesi kareyle (ref) farklı olan parlak pikselleri tahta bölgesinde toplar,
+               * bunların sınır kutusunun merkezini parçanın merkezi sayar ve hamlenin hedef merkezine olan
+               * farkı (px) döner: [ex, ey]. Parmak bu kadar kaydırılırsa parça tam hedef hücrelere oturur.
+               * Parça bulunamazsa ya da boyutu tutmazsa null döner.
+               */
+              fun liftedError(frame: Frame, ref: Frame, p: Piece, m: Move): DoubleArray? {
+                  f = frame
+                  s = frame.w / 1080.0
+                  val y0 = max(0, (cy(0) - P * s / 2 - 450 * s).roundToInt())
+                  val y1 = min(frame.h, (cy(7) + P * s / 2 + 40 * s).roundToInt())
+                  val step = max(2, (3 * s).roundToInt())
+                  val nx = frame.w / step
+                  val ny = (y1 - y0) / step
+                  if (nx < 10 || ny < 10) return null
+                  val colCnt = IntArray(nx)
+                  val rowCnt = IntArray(ny)
+                  for (ky in 0 until ny) {
+                      val y = y0 + ky * step
+                      for (kx in 0 until nx) {
+                          val x = kx * step
+                          if (!bright(x, y)) continue
+                          val d = abs(f.r(x, y) - ref.r(x, y)) + abs(f.g(x, y) - ref.g(x, y)) + abs(f.b(x, y) - ref.b(x, y))
+                          if (d < 90) continue
+                          colCnt[kx]++
+                          rowCnt[ky]++
+                      }
+                  }
+                  val gap = max(4, (12 * s / step).roundToInt())
+                  val len = max(4, (30 * s / step).roundToInt())
+                  val c = bestSeg(colCnt, segments(colCnt, 2, gap, len)) ?: return null
+                  val r = bestSeg(rowCnt, segments(rowCnt, 3, gap, len)) ?: return null
+                  val wpx = (c[1] - c[0] + 1) * step
+                  val hpx = (r[1] - r[0] + 1) * step
+                  val ew = p.w * P * s
+                  val eh = p.h * P * s
+                  if (wpx < 0.45 * ew || wpx > 1.5 * ew || hpx < 0.45 * eh || hpx > 1.5 * eh) return null
+                  val acx = (c[0] + c[1]) / 2.0 * step
+                  val acy = y0 + (r[0] + r[1]) / 2.0 * step
+                  val tcx = (cx(m.c) + cx(m.c + p.w - 1)) / 2.0
+                  val tcy = (cy(m.r) + cy(m.r + p.h - 1)) / 2.0
+                  val ex = tcx - acx
+                  val ey = tcy - acy
+                  if (abs(ex) > 500 * s || abs(ey) > 500 * s) return null
+                  return doubleArrayOf(ex, ey)
+              }
+
+              fun analyze(frame: Frame): Reading? {
+                  f = frame
+                  s = frame.w / 1080.0
+                  quality()
+                  if (qCount < 60) {
+                      if (!fit()) return null
+                  }
+                  val board = IntArray(8)
+                  val rad = (8 * s).roundToInt()
+                  for (r in 0..7) {
+                      for (c in 0..7) {
+                          if (filled(avg(cx(c), cy(r), rad))) board[r] = board[r] or (1 shl c)
+                      }
+                  }
+                  val pieces = ArrayList<Piece>()
+                  for (i in 0..2) {
+                      val p = readPiece(i)
+                      if (p != null) pieces.add(p)
+                  }
+                  return Reading(board, pieces)
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/AutoTapService.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.os.Handler
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Parçayı tepsiden alıp tahtaya sürükleyen dokunma servisi (Erişilebilirlik izni ister). */
+          class AutoTapService : AccessibilityService() {
+              companion object {
+                  @Volatile
+                  var instance: AutoTapService? = null
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              fun drag(x1: Float, y1: Float, x2: Float, y2: Float, dur: Long, done: (Boolean) -> Unit) {
+                  val path = Path()
+                  path.moveTo(x1, y1)
+                  path.lineTo(x2, y2)
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0L, dur))
+                      .build()
+                  val ok = dispatchGesture(gesture, object : AccessibilityService.GestureResultCallback() {
+                      override fun onCompleted(gestureDescription: GestureDescription?) {
+                          done(true)
+                      }
+
+                      override fun onCancelled(gestureDescription: GestureDescription?) {
+                          done(false)
+                      }
+                  }, null)
+                  if (!ok) done(false)
+              }
+
+              private fun seg(
+                  prev: GestureDescription.StrokeDescription?,
+                  fx: Float, fy: Float, tx: Float, ty: Float,
+                  dur: Long, more: Boolean, worker: Handler,
+                  onOk: () -> Unit, onFail: () -> Unit
+              ): GestureDescription.StrokeDescription {
+                  val path = Path()
+                  path.moveTo(fx, fy)
+                  if (Math.abs(tx - fx) + Math.abs(ty - fy) >= 1f) path.lineTo(tx, ty)
+                  val st = if (prev == null) {
+                      GestureDescription.StrokeDescription(path, 0L, dur, more)
+                  } else {
+                      prev.continueStroke(path, 0L, dur, more)
+                  }
+                  val g = GestureDescription.Builder().addStroke(st).build()
+                  val ok = dispatchGesture(g, object : AccessibilityService.GestureResultCallback() {
+                      override fun onCompleted(gestureDescription: GestureDescription?) {
+                          onOk()
+                      }
+
+                      override fun onCancelled(gestureDescription: GestureDescription?) {
+                          onFail()
+                      }
+                  }, worker)
+                  if (!ok) onFail()
+                  return st
+              }
+
+              /**
+               * Görüntü referanslı sürükleme: parçayı tutar, hedefe yaklaştırır ve parmağı KALDIRMADAN bekler.
+               * measure() ekran görüntüsünden kalkmış parçanın gerçek yerini ölçüp hedefe olan farkı [ex, ey] verir,
+               * parmak o kadar kaydırılır (en çok 2 düzeltme). Sonra bırakılır.
+               * Böylece blok parmağın üstüne kayma gibi oyun davranışları yerleşimi bozmaz.
+               */
+              fun dragRef(
+                  x1: Float, y1: Float, x2: Float, y2: Float,
+                  worker: Handler, tol: Float, maxX: Float, maxY: Float,
+                  measure: () -> FloatArray?, done: (Boolean) -> Unit
+              ) {
+                  var st: GestureDescription.StrokeDescription? = null
+                  var cx = x2
+                  var cy = y2
+                  fun finish() {
+                      st = seg(st, cx, cy, cx, cy, 80L, false, worker, { done(true) }, { done(false) })
+                  }
+                  fun refine(n: Int) {
+                      worker.postDelayed({
+                          val e = try { measure() } catch (t: Throwable) { null }
+                          if (e == null || n >= 2 || Math.abs(e[0]) + Math.abs(e[1]) < tol) {
+                              finish()
+                          } else {
+                              val nx = (cx + e[0]).coerceIn(1f, maxX)
+                              val ny = (cy + e[1]).coerceIn(1f, maxY)
+                              st = seg(st, cx, cy, nx, ny, 220L, true, worker, { refine(n + 1) }, { done(false) })
+                              cx = nx
+                              cy = ny
+                          }
+                      }, 300L)
+                  }
+                  st = seg(null, x1, y1, x2, y2, 450L, true, worker, { refine(0) }, { done(false) })
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/CaptureService.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.DisplayMetrics
+          import android.view.Gravity
+          import android.view.WindowManager
+          import java.nio.ByteBuffer
+
+          class CaptureService : Service() {
+              private class Pending(val move: Move, val before: IntArray)
+
+              private var projection: MediaProjection? = null
+              private var reader: ImageReader? = null
+              private var vd: VirtualDisplay? = null
+              private var overlay: OverlayView? = null
+              private var wm: WindowManager? = null
+
+              private val thread = HandlerThread("blok-capture")
+              private lateinit var handler: Handler
+              private val ui = Handler(Looper.getMainLooper())
+              private val analyzer = Analyzer()
+
+              @Volatile private var running = false
+              @Volatile private var busyUntil = 0L
+              @Volatile private var dirty = true
+              @Volatile private var stable = 0
+              @Volatile private var corr = ""
+
+              // Son değişen kare (ekran durağanlaşınca bunun üzerinde analiz yapılır)
+              private var stored: ByteArray? = null
+              private var sRs = 0
+              private var sPs = 4
+              private var sW = 0
+              private var sH = 0
+              private var lastHash = 0L
+              private var lastAnalysis = 0L
+              private var overlayEmpty = true
+
+              // Otomatik oynama
+              private var auto = false
+              private var offX = 0.0
+              private var offY = 0.0
+              private var candIdx = 0
+              private var fails = 0
+              private var pending: Pending? = null
+              private var autoNote = ""
+              private val offs = doubleArrayOf(0.0, -140.0, -280.0, 140.0, -420.0, -70.0)
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      try {
+                          step()
+                      } catch (e: Throwable) {
+                          // Tek kare hatası servisi durdurmasın
+                      }
+                      handler.postDelayed(this, 150)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "STOP") {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (running) return START_NOT_STICKY
+                  startForegroundCompat()
+
+                  val code = intent?.getIntExtra("code", 0) ?: 0
+                  auto = intent?.getBooleanExtra("auto", false) ?: false
+                  @Suppress("DEPRECATION")
+                  val data = intent?.getParcelableExtra<Intent>("data")
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val prefs = getSharedPreferences("cal", Context.MODE_PRIVATE)
+                  offX = prefs.getFloat("offX", 0f).toDouble()
+                  offY = prefs.getFloat("offY", 0f).toDouble()
+
+                  thread.start()
+                  handler = Handler(thread.looper)
+
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  val proj = mpm.getMediaProjection(code, data)
+                  projection = proj
+                  proj.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          ui.post { stopSelf() }
+                      }
+                  }, handler)
+
+                  val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  wm = windowManager
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  windowManager.defaultDisplay.getRealMetrics(dm)
+                  val w = dm.widthPixels
+                  val h = dm.heightPixels
+
+                  val ir = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  reader = ir
+                  vd = proj.createVirtualDisplay(
+                      "blok-cap", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      ir.surface, null, handler
+                  )
+
+                  val ov = OverlayView(this)
+                  overlay = ov
+                  val lp = WindowManager.LayoutParams(
+                      w, h,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = 0
+                  lp.y = 0
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                  }
+                  windowManager.addView(ov, lp)
+
+                  running = true
+                  handler.postDelayed(tick, 500)
+                  return START_NOT_STICKY
+              }
+
+              /**
+               * Her 150 ms'de yeni kare varsa seyrek örneklerle özet çıkarır (çok ucuz).
+               * Ekran değiştiyse kareyi saklar, durağanlaşınca (2 ölçüm aynı) tam analizi bir kez çalıştırır.
+               */
+              private fun step() {
+                  val now = SystemClock.uptimeMillis()
+                  if (now < busyUntil) return
+                  val r = reader ?: return
+                  val img = r.acquireLatestImage()
+                  if (img != null) {
+                      try {
+                          val plane = img.planes[0]
+                          val buf = plane.buffer
+                          val fr = Frame(buf, plane.rowStride, plane.pixelStride, img.width, img.height)
+                          val hsh = analyzer.quickHash(fr)
+                          if (hsh != lastHash || stored == null) {
+                              lastHash = hsh
+                              stable = 0
+                              dirty = true
+                              buf.rewind()
+                              val n = buf.remaining()
+                              var arr = stored
+                              if (arr == null || arr.size < n) {
+                                  arr = ByteArray(n)
+                                  stored = arr
+                              }
+                              buf.get(arr, 0, n)
+                              sRs = plane.rowStride
+                              sPs = plane.pixelStride
+                              sW = img.width
+                              sH = img.height
+                          } else {
+                              stable++
+                          }
+                      } finally {
+                          img.close()
+                      }
+                  } else {
+                      stable++
+                  }
+                  if (!dirty) return
+                  if (stable < 2 && now - lastAnalysis < 1200) return
+                  val arr = stored ?: return
+                  dirty = false
+                  lastAnalysis = now
+                  process(Frame(ByteBuffer.wrap(arr), sRs, sPs, sW, sH))
+              }
+
+              private fun process(frame: Frame) {
+                  val rd = analyzer.analyze(frame)
+                  if (rd == null) {
+                      pending = null
+                      if (!overlayEmpty) {
+                          overlayEmpty = true
+                          ui.post { overlay?.update(emptyList(), 0.0, 0.0, 1.0, "") }
+                      }
+                      return
+                  }
+
+                  // Önceki otomatik hamlenin sonucunu değerlendir
+                  val pa = pending
+                  if (pa != null) {
+                      pending = null
+                      if (!sameBoard(rd.board, pa.before)) {
+                          fails = 0
+                          calibrate(pa, rd.board)
+                      } else {
+                          fails++
+                          if (fails >= 6) {
+                              auto = false
+                              autoNote = "OTO durdu: parca tasinmadi"
+                          } else {
+                              candIdx++
+                              offY = offs[candIdx % offs.size]
+                          }
+                      }
+                  }
+
+                  val moves: List<Move> = if (rd.pieces.isEmpty()) emptyList() else Solver.solve(rd.board, rd.pieces)
+                  val dx = analyzer.dx
+                  val dy = analyzer.dy
+                  val s = analyzer.s
+                  overlayEmpty = false
+                  val shapes = if (rd.pieces.isEmpty()) {
+                      "parca yok"
+                  } else {
+                      rd.pieces.joinToString("  ") { (it.idx + 1).toString() + ":" + it.rows.joinToString(",") }
+                  }
+                  val oto = if (autoNote.isNotEmpty()) {
+                      " | " + autoNote
+                  } else if (auto) {
+                      " | OTO oy=" + offY.toInt().toString() + (if (corr.isNotEmpty()) " " + corr else "")
+                  } else {
+                      ""
+                  }
+                  val info = "S8 dy=" + dy.toInt().toString() + " | " + shapes + oto
+                  ui.post { overlay?.update(moves, dx, dy, s, info) }
+
+                  if (auto && moves.isNotEmpty()) act(moves[0], rd)
+              }
+
+              private fun act(m: Move, rd: Reading) {
+                  val svc = AutoTapService.instance
+                  if (svc == null) {
+                      autoNote = "OTO: erisilebilirlik izni kapali"
+                      return
+                  }
+                  autoNote = ""
+                  val p = m.p
+                  val s = analyzer.s
+                  val tx = ((Analyzer.CX0 + analyzer.dx + Analyzer.P * (m.c + p.gj) + offX) * s).toFloat()
+                  val ty = ((Analyzer.CY0 + analyzer.dy + Analyzer.P * (m.r + p.gi) + offY) * s).toFloat()
+                  // Sürükleme öncesi kare: kalkmış parçayı bulmak için referans
+                  val arr = stored
+                  val ref = if (arr != null) Frame(ByteBuffer.wrap(arr), sRs, sPs, sW, sH) else null
+                  pending = Pending(m, rd.board.copyOf())
+                  busyUntil = SystemClock.uptimeMillis() + 9000
+                  val tol = (0.1 * Analyzer.P * s).toFloat()
+                  svc.dragRef(
+                      p.gx.toFloat(), p.gy.toFloat(), tx, ty,
+                      handler, tol, (sW - 1).toFloat(), (sH - 1).toFloat(),
+                      { if (ref == null) null else measureLifted(ref, m) },
+                      { _ ->
+                          busyUntil = SystemClock.uptimeMillis() + 900
+                          stable = 0
+                          dirty = true
+                      }
+                  )
+              }
+
+              /** Parmak basılıyken anlık ekran görüntüsünden parçanın hedefe uzaklığını (px) ölçer. */
+              private fun measureLifted(ref: Frame, m: Move): FloatArray? {
+                  val rdr = reader ?: return null
+                  val img = rdr.acquireLatestImage()
+                  if (img == null) {
+                      corr = "olcum yok"
+                      return null
+                  }
+                  try {
+                      val pl = img.planes[0]
+                      val fr = Frame(pl.buffer, pl.rowStride, pl.pixelStride, img.width, img.height)
+                      val e = analyzer.liftedError(fr, ref, m.p, m)
+                      if (e == null) {
+                          corr = "parca bulunamadi"
+                          return null
+                      }
+                      corr = "duz=" + e[0].toInt().toString() + "," + e[1].toInt().toString()
+                      return floatArrayOf(e[0].toFloat(), e[1].toFloat())
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun sameBoard(a: IntArray, b: IntArray): Boolean {
+                  for (i in 0 until 8) {
+                      if (a[i] != b[i]) return false
+                  }
+                  return true
+              }
+
+              /**
+               * Hamle sonrası tahtadan parçanın gerçekte nereye düştüğünü bulur ve
+               * sürükleme ofsetini buna göre düzeltir (parmağa göre yükselme gibi oyun davranışları için).
+               */
+              private fun calibrate(pa: Pending, after: IntArray) {
+                  val p = pa.move.p
+                  var found = 0
+                  var fr = 0
+                  var fc = 0
+                  for (r in 0..(8 - p.h)) {
+                      for (c in 0..(8 - p.w)) {
+                          var ok = true
+                          for (i in 0 until p.h) {
+                              if ((pa.before[r + i] and (p.rows[i] shl c)) != 0) {
+                                  ok = false
+                                  break
+                              }
+                          }
+                          if (!ok) continue
+                          val nb = pa.before.copyOf()
+                          for (i in 0 until p.h) nb[r + i] = nb[r + i] or (p.rows[i] shl c)
+                          Solver.clr(nb)
+                          if (sameBoard(nb, after)) {
+                              found++
+                              fr = r
+                              fc = c
+                          }
+                      }
+                  }
+                  if (found == 1) {
+                      val dr = fr - pa.move.r
+                      val dc = fc - pa.move.c
+                      if (dr != 0 || dc != 0) {
+                          offY -= dr * Analyzer.P
+                          offX -= dc * Analyzer.P
+                      }
+                      getSharedPreferences("cal", Context.MODE_PRIVATE).edit()
+                          .putFloat("offX", offX.toFloat())
+                          .putFloat("offY", offY.toFloat())
+                          .apply()
+                  }
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(NotificationChannel("cap", "Blok Yardımcısı", NotificationManager.IMPORTANCE_LOW))
+                  val stopPi = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, CaptureService::class.java).setAction("STOP"),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  @Suppress("DEPRECATION")
+                  val n = Notification.Builder(this, "cap")
+                      .setContentTitle("Blok Yardımcısı çalışıyor")
+                      .setContentText("Oyunu aç, öneriler ekranda görünür")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .addAction(Notification.Action.Builder(android.R.drawable.ic_delete, "Durdur", stopPi).build())
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  try { if (::handler.isInitialized) handler.removeCallbacksAndMessages(null) } catch (e: Throwable) {}
+                  try { vd?.release() } catch (e: Throwable) {}
+                  try { reader?.close() } catch (e: Throwable) {}
+                  try { projection?.stop() } catch (e: Throwable) {}
+                  try { overlay?.let { wm?.removeView(it) } } catch (e: Throwable) {}
+                  try { thread.quitSafely() } catch (e: Throwable) {}
+                  super.onDestroy()
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/MainActivity.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val reqCapture = 1
+              private val reqOverlay = 2
+              private val reqNotif = 3
+              private var wantAuto = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (22 * d).toInt()
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(0xFF100D2B.toInt())
+                  root.setPadding(pad, pad * 2, pad, pad)
+
+                  val title = TextView(this)
+                  title.text = "Blok Yardımcısı"
+                  title.textSize = 28f
+                  title.setTextColor(0xFFECEAFF.toInt())
+                  root.addView(title)
+
+                  val info = TextView(this)
+                  info.text = "1. Bir Başlat düğmesine bas ve izinleri ver.\n" +
+                      "2. Oyunu aç.\n" +
+                      "3. Alttaki 3 parçanın nereye konacağı numaralı renkli çerçevelerle tahtanın üstünde görünür. " +
+                      "Parçanın altındaki numara oynama sırasıdır.\n" +
+                      "4. Hamle yapınca öneri kendiliğinden yenilenir.\n\n" +
+                      "Durdurmak için bildirimdeki Durdur'a bas.\n\nSürüm 7"
+                  info.textSize = 16f
+                  info.setTextColor(0xFF9A96C9.toInt())
+                  info.setPadding(0, pad, 0, pad)
+                  root.addView(info)
+
+                  val start = Button(this)
+                  start.text = "Başlat: sadece öneri göster"
+                  start.setOnClickListener {
+                      wantAuto = false
+                      begin()
+                  }
+                  root.addView(start)
+
+                  val startAuto = Button(this)
+                  startAuto.text = "Başlat: otomatik oyna"
+                  startAuto.setOnClickListener {
+                      if (AutoTapService.instance == null) {
+                          AlertDialog.Builder(this)
+                              .setTitle("Erişilebilirlik izni gerekli")
+                              .setMessage(
+                                  "Otomatik oynamak için parçaları sürükleyen servisi açman gerekiyor:\n\n" +
+                                      "Ayarlar → Erişilebilirlik → Yüklü uygulamalar → Blok Yardımcısı 8 otomatik dokunma → Aç.\n\n" +
+                                      "Anahtar gri ve kapalıysa: Ayarlar → Uygulamalar → Blok Yardımcısı 8 → sağ üst üç nokta → " +
+                                      "Kısıtlı ayarlara izin ver. Sonra tekrar dene.\n\nSonra bu ekrana dönüp tekrar bas."
+                              )
+                              .setPositiveButton("Ayarları aç") { _, _ ->
+                                  startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                              }
+                              .setNegativeButton("Vazgeç", null)
+                              .show()
+                      } else {
+                          wantAuto = true
+                          begin()
+                      }
+                  }
+                  root.addView(startAuto)
+
+                  val stop = Button(this)
+                  stop.text = "Durdur"
+                  stop.setOnClickListener {
+                      stopService(Intent(this, CaptureService::class.java))
+                      Toast.makeText(this, "Durduruldu", Toast.LENGTH_SHORT).show()
+                  }
+                  root.addView(stop)
+                  root.gravity = Gravity.TOP
+
+                  setContentView(root)
+              }
+
+              private fun begin() {
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), reqNotif)
+                      return
+                  }
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Diğer uygulamaların üstünde göster iznini aç", Toast.LENGTH_LONG).show()
+                      startActivityForResult(
+                          Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                          reqOverlay
+                      )
+                      return
+                  }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  startActivityForResult(mpm.createScreenCaptureIntent(), reqCapture)
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == reqNotif) begin()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqOverlay) {
+                      if (Settings.canDrawOverlays(this)) begin()
+                  } else if (requestCode == reqCapture) {
+                      if (resultCode == RESULT_OK && data != null) {
+                          val i = Intent(this, CaptureService::class.java)
+                          i.putExtra("code", resultCode)
+                          i.putExtra("data", data)
+                          i.putExtra("auto", wantAuto)
+                          startForegroundService(i)
+                          Toast.makeText(this, "Başladı. Şimdi oyunu aç.", Toast.LENGTH_LONG).show()
+                          moveTaskToBack(true)
+                      } else {
+                          Toast.makeText(this, "Ekran kaydı izni verilmedi", Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/OverlayView.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import android.view.View
+
+          /** Oyunun üstüne çizilen, dokunuşu geçiren öneri katmanı. */
+          class OverlayView(context: Context) : View(context) {
+              private var moves: List<Move> = emptyList()
+              private var dx = 0.0
+              private var dy = 0.0
+              private var s = 1.0
+              private var info = ""
+
+              private val colors = intArrayOf(0xFF34FFB4.toInt(), 0xFFFF4FD8.toInt(), 0xFFFFFFFF.toInt())
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+              private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private val infoPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.LEFT
+                  color = 0xCCFFFFFF.toInt()
+              }
+
+              fun update(m: List<Move>, dx: Double, dy: Double, s: Double, info: String) {
+                  this.info = info
+                  this.moves = m
+                  this.dx = dx
+                  this.dy = dy
+                  this.s = s
+                  invalidate()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  if (info.isNotEmpty()) {
+                      infoPaint.textSize = (26 * s).toFloat()
+                      canvas.drawText(info, (24 * s).toFloat(), ((Analyzer.CY0 + dy + 1290) * s).toFloat(), infoPaint)
+                  }
+                  val pitch = Analyzer.P * s
+                  val half = (pitch * 0.43).toFloat()
+                  for ((k, m) in moves.withIndex()) {
+                      val col = colors[k % colors.size]
+                      var first = true
+                      for (i in 0 until m.p.h) {
+                          for (j in 0 until m.p.w) {
+                              if (((m.p.rows[i] shr j) and 1) == 0) continue
+                              val x = ((Analyzer.CX0 + dx + Analyzer.P * (m.c + j)) * s).toFloat()
+                              val y = ((Analyzer.CY0 + dy + Analyzer.P * (m.r + i)) * s).toFloat()
+                              fill.color = (col and 0x00FFFFFF) or 0x2E000000
+                              canvas.drawRoundRect(x - half, y - half, x + half, y + half, (12 * s).toFloat(), (12 * s).toFloat(), fill)
+                              stroke.color = col
+                              stroke.strokeWidth = (6 * s).toFloat()
+                              canvas.drawRoundRect(x - half, y - half, x + half, y + half, (12 * s).toFloat(), (12 * s).toFloat(), stroke)
+                              if (first) {
+                                  first = false
+                                  drawNumber(canvas, (k + 1).toString(), x - half + (24 * s).toFloat(), y - half + (36 * s).toFloat(), (36 * s).toFloat(), col)
+                              }
+                          }
+                      }
+                      // Alttaki tepsiye, o parçanın kaçıncı oynanacağını yaz
+                      val bx = ((85 + 315 * m.idx + 141.5 + dx) * s).toFloat()
+                      val by = ((Analyzer.CY0 + dy + 1185) * s).toFloat()
+                      fill.color = col
+                      canvas.drawCircle(bx, by, (24 * s).toFloat(), fill)
+                      drawNumber(canvas, (k + 1).toString(), bx, by + (10 * s).toFloat(), (30 * s).toFloat(), 0xFF0B0B1C.toInt(), false)
+                  }
+              }
+
+              private fun drawNumber(c: Canvas, t: String, x: Float, y: Float, size: Float, color: Int, outline: Boolean = true) {
+                  text.textSize = size
+                  if (outline) {
+                      text.style = Paint.Style.STROKE
+                      text.strokeWidth = size / 4
+                      text.color = 0xFF0B0B1C.toInt()
+                      c.drawText(t, x, y, text)
+                  }
+                  text.style = Paint.Style.FILL
+                  text.color = if (outline) color else color
+                  c.drawText(t, x, y, text)
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/java/com/blok/yardimci
+          cat > app/src/main/java/com/blok/yardimci/Solver.kt <<'BLOK_EOF'
+          package com.blok.yardimci
+
+          class Piece(
+              val idx: Int,
+              val h: Int,
+              val w: Int,
+              val rows: IntArray,
+              val gx: Double = 0.0,
+              val gy: Double = 0.0,
+              val gi: Int = 0,
+              val gj: Int = 0
+          )
+
+          class Move(val idx: Int, val r: Int, val c: Int, val cl: Int, val p: Piece)
+
+          class Reading(val board: IntArray, val pieces: List<Piece>)
+
+          class Search {
+              var bestScore = -1e18
+              var best: List<Move> = emptyList()
+              private val cur = ArrayList<Move>()
+
+              fun dfs(rows: IntArray, pm: List<Piece>, k: Int, lines: Int, pen: Int) {
+                  if (k == pm.size) {
+                      val sc = Solver.ev(rows, lines) - pen
+                      if (sc > bestScore) {
+                          bestScore = sc
+                          best = ArrayList(cur)
+                      }
+                      return
+                  }
+                  val p = pm[k]
+                  var any = false
+                  for (r in 0..(8 - p.h)) {
+                      for (c in 0..(8 - p.w)) {
+                          var ok = true
+                          for (i in 0 until p.h) {
+                              if ((rows[r + i] and (p.rows[i] shl c)) != 0) {
+                                  ok = false
+                                  break
+                              }
+                          }
+                          if (!ok) continue
+                          any = true
+                          val nr = rows.copyOf()
+                          for (i in 0 until p.h) nr[r + i] = nr[r + i] or (p.rows[i] shl c)
+                          val cl = Solver.clr(nr)
+                          cur.add(Move(p.idx, r, c, cl, p))
+                          dfs(nr, pm, k + 1, lines + cl, pen)
+                          cur.removeAt(cur.size - 1)
+                      }
+                  }
+                  if (!any) dfs(rows, pm, k + 1, lines, pen + 1000)
+              }
+          }
+
+          object Solver {
+              private val POP = IntArray(256) { Integer.bitCount(it) }
+              private val eb = IntArray(8)
+
+              /** Dolu satır ve sütunları temizler, temizlenen çizgi sayısını döner. */
+              fun clr(r: IntArray): Int {
+                  var col = 255
+                  var fr = 0
+                  for (i in 0 until 8) {
+                      col = col and r[i]
+                      if (r[i] == 255) fr++
+                  }
+                  for (i in 0 until 8) {
+                      r[i] = if (r[i] == 255) 0 else (r[i] and col.inv() and 255)
+                  }
+                  return fr + POP[col]
+              }
+
+              /** Tahta değerlendirmesi: yüksek = iyi. */
+              fun ev(r: IntArray, lines: Int): Double {
+                  var f = 0
+                  var tr = 0
+                  var iso = 0
+                  for (i in 0 until 8) {
+                      f += POP[r[i]]
+                      tr += POP[(r[i] xor (r[i] shr 1)) and 127]
+                      if (i < 7) tr += POP[r[i] xor r[i + 1]]
+                      val e = r[i].inv() and 255
+                      val l = ((r[i] shl 1) or 1) and 255
+                      val rt = (r[i] shr 1) or 128
+                      val u = if (i > 0) r[i - 1] else 255
+                      val d = if (i < 7) r[i + 1] else 255
+                      iso += POP[e and l and rt and u and d]
+                  }
+                  var big = false
+                  var a = 0
+                  while (a < 6 && !big) {
+                      for (b in 0 until 6) {
+                          val m = 7 shl b
+                          if ((r[a] and m) == 0 && (r[a + 1] and m) == 0 && (r[a + 2] and m) == 0) {
+                              big = true
+                              break
+                          }
+                      }
+                      a++
+                  }
+                  // Esneklik: boş bölgelerde yeni parçaların sığabileceği yer sayısı
+                  var h3 = 0
+                  var v3 = 0
+                  var sq = 0
+                  var b3 = 0
+                  for (i in 0 until 8) {
+                      val ei = r[i].inv() and 255
+                      eb[i] = ei
+                      h3 += POP[ei and (ei shr 1) and (ei shr 2)]
+                  }
+                  for (i in 0 until 6) {
+                      val a = eb[i] and eb[i + 1] and eb[i + 2]
+                      v3 += POP[a]
+                      b3 += POP[a and (a shr 1) and (a shr 2)]
+                  }
+                  for (i in 0 until 7) {
+                      val a = eb[i] and eb[i + 1]
+                      sq += POP[a and (a shr 1)]
+                  }
+                  val mobility = 2.0 * minOf(h3, 14) + 2.0 * minOf(v3, 14) + 3.0 * minOf(sq, 12) + 10.0 * minOf(b3, 4)
+                  return 40.0 * lines + 2.0 * (64 - f) - 1.5 * tr - 14.0 * iso + (if (big) 18.0 else 0.0) + mobility
+              }
+
+              fun solve(board: IntArray, pieces: List<Piece>): List<Move> {
+                  val perms = ArrayList<List<Piece>>()
+                  permute(pieces, emptyList(), perms)
+                  val seen = HashSet<String>()
+                  val search = Search()
+                  for (pm in perms) {
+                      val key = pm.joinToString("|") { it.h.toString() + "x" + it.w + ":" + it.rows.joinToString(",") }
+                      if (!seen.add(key)) continue
+                      search.dfs(board.copyOf(), pm, 0, 0, 0)
+                  }
+                  return search.best
+              }
+
+              private fun permute(rest: List<Piece>, acc: List<Piece>, out: MutableList<List<Piece>>) {
+                  if (rest.isEmpty()) {
+                      out.add(acc)
+                      return
+                  }
+                  for (i in rest.indices) {
+                      permute(rest.filterIndexed { j, _ -> j != i }, acc + rest[i], out)
+                  }
+              }
+          }
+          BLOK_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'BLOK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="a11y_desc">Blok Yardımcısı, oyunda parçaları sizin yerinize sürükleyip bırakır.</string>
+          </resources>
+          BLOK_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'BLOK_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="200" />
+          BLOK_EOF
+          cat > build.gradle.kts <<'BLOK_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          BLOK_EOF
+          cat > gradle.properties <<'BLOK_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          BLOK_EOF
+          cat > settings.gradle.kts <<'BLOK_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "BlokYardimcisi"
+          include(":app")
+          BLOK_EOF
+          base64 -d > app/debug.keystore <<'BLOK_B64'
+          MIIKAAIBAzCCCaoGCSqGSIb3DQEHAaCCCZsEggmXMIIJkzCCBaoGCSqGSIb3DQEHAaCCBZsEggWX
+          MIIFkzCCBY8GCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcNAQUNMFkwOAYJKoZIhvcNAQUM
+          MCsEFLWCvYCg5c5H20zT8P9E681vNccvAgInEAIBIDAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQB
+          KgQQYPPeH5EqCmhBDJKn/0xq9ASCBNAIjpApNUHmr4WVgeXlYA/+CkOuQkhTXBuuPNcS/HxSSghT
+          5i7NZdV2/dioMHt8MxmwJ4Qk2U5lKashN0J7sI6D6eBWY94fJM9+uwRM5ic31SxPtoSHs4CnaY21
+          evmNG0HCuwPnLWQdOb9HysrLdWGI6nDXoMUn9NAwv4wJjXk2uEcW5YaIrRR+MLJ3Y8auGNak325F
+          lMpUmpulKllvflhXhS3VdkRsTc4blRsugeCVwI01e3PsyqxWapB2ePYw2FNDwmhAPi1AH4CMAVra
+          6x5Uj+VI7TcMAQLnEnp8Y/9e5KGL6mnAc/x6+Yi6sLyk2NlbQvw2JiifRWnf3FdZatjiCa/5hz4n
+          8zU0JEvFm9Jbn9351QQby6xqQNBKEj6cD9rJW0gR77Oc3EpYxEbQgzYPQDe0Fz1T/swt21gtD/X1
+          IzbxnWFZ9lZATiZmDJeiqWWYHCt4BJ0pF+mDdH+Byzl58Gigd2ogZJqUYksYoMtUOsgUIHKnAC4J
+          tdLrCsXxQwhFVGOIUWqAeqp2dp1R/PZrfQLYu0Pk7YQuuMIy0Q5UJUJQeOhOzFSUtDKgiPuzFNI0
+          Fl0JqX/M3SaM13qgD+QpIOtGC0Nx8F8ryROZ5ZlYvxgGLnh8S5zCSv9R3c64h/7YVHBgFHIQAIHt
+          42AbWGjOg8oX0TWr7NgjRKKtBiIAOGXGyMeJBBzBbS74AziWPKzVz8WDmfxQLNclUl5LPrVsEQGL
+          A8zg7pCkPh+rluXMIj82Div1OrISegVuRg2kNN32n1wKh3tesEJo437jeXF4WL4D6hN/gCaIkt/V
+          e6mnwe8S4znBdYHZFVR66Dplplw6MNPma35YZP2BZJHqRiI4Za+zEEj4ZY3ubhVRRAEfFo3Ya3Lw
+          DmgxUPJUB9rrkOEvahJzW7ZahK4FkHNxLYLmh8Hst+lEU+ltAocfPEN566lytThs0LBj3dLfHlCJ
+          wJuVcK+hl03p9iPp19kvtCWEecXYniny4w7MQXh1072v3RUUmE7KD3TeObS8NnKQ+9dH2IgpWIOW
+          EbIfKJ9ztIw+i17ulrMuMfZ51rnG1kX+kBgs3pKdqDbh6Go1oBUkhNMMccC/HVtLpvN7H1FWxaAI
+          jQ2dmm9zblPA/sE+qV1a/2x57Zlgd6oyeZk0bS4GWMvXi4NA7LBf2SqSeLP1BSX5FOz8qYFj7f8G
+          UhI9nbZ+jMzNn7yToiMlp7F5NjA9F0irdLRLK0r0I3q+sxIRznJn0Rk2yZ7nWGe6VOR4dnSDwJN5
+          c2Fk6gADVLW6TXiWzqOxUzJOQyDcSHp9cfZ3d7x1gySzkwH70jOUQl2As+5JSseNKElenPzzWtly
+          CEXuc0L3L+2o4qOlUQXppztYiraxb+OE1XTVhmIAlF+ZIcDLBtRQvucPLZyibpdnFYj68Fhr4yml
+          zYSQdmskHt0ynlzHys1pAlIMnoajjqc0zcVwNpEX/lh0IO+a5dUwlet/4Orl3ISrppPqZ4w46acW
+          sWE1RVDvD/fxmwGNPw88AUBwNny7lUkKzaMjCiC3zDnBUtOwIhWUsUdl+Wz2NQwg9DcElGLTXRZ0
+          3oxw7LewrrJmgRGEon3qeTgK/tPP65F+eoCCulZrBHKpzeoLklGhWtUB4pBtTokXLyziFxlFnx/t
+          9zE8MBcGCSqGSIb3DQEJFDEKHggAYgBsAG8AazAhBgkqhkiG9w0BCRUxFAQSVGltZSAxNzk0NzUy
+          NjQ2MTA4MIID4QYJKoZIhvcNAQcGoIID0jCCA84CAQAwggPHBgkqhkiG9w0BBwEwZgYJKoZIhvcN
+          AQUNMFkwOAYJKoZIhvcNAQUMMCsEFAZRpU/cdqGBdn8RdItKEDs/aATRAgInEAIBIDAMBggqhkiG
+          9w0CCQUAMB0GCWCGSAFlAwQBKgQQLhaguAsz0FaKmvyJpv83SICCA1BBnuOYkZT/vuXyT9CH3aRh
+          I8AZAzKXl/XbU2sfIA6l3QRCIauZqTWNC6vpozotVicKuGwr+9piLq61MHuPE78xVZs+J5adyR53
+          6A9a8GvcOwAn3zqub1zunFGOvJxYMix6xwq6oAz4LXDweaAs+Fu3GTQPw7Jf91n6fqr39B5dXyWH
+          suBhmmEgIjbmpnzFBIvUEqVhfR9spsHq96f8dKwgYYao4qvolW/PNsPJNEY1jZnKN/W+egFFTAz2
+          0vhhELvqHiEYIr5MOILapOObO1DH+Qqc/nti7yHn5obzYA1F6Kz+X2nNEIjsWawyB7ixrePLEVhY
+          VR6n2XrBjwwOIViMVOVzp3c24Yzc3O+avevS6AQiMA2PsTKb6bNaas+7tijDh4PVwSvQX1YohqPl
+          ZaD0lqnKyR8uZJBWJHTiQAf/z3920daiy+Zf+QnBWK4f4U91Tle+o2Y3W8fCdMN2dM80AoY3hCxX
+          WOjalQTb1T10FnuMNEHkV1cBSstYKm3qzYBHra91IEABhcpGgMlHy3kIbYdO4h3Mkl2rcL4lzqRE
+          kMelYmpq265Z0vJoJveDO3AcJlBKNXGgN9rwB4JgVTcHY527Dx7cKsY+Et9VLIewIKgmrOvtz2rB
+          +0FSd9744eOUMdV24W6LW3fklQkl/sy1ZG65smbnDjto0Sk9DgVFUC7DXXdCTmRkKx1DWStnG+eW
+          IGgj94PB3VcPnM9c5MfZFqRS+q15TP12dhRpJMIiuI4q3Q57Tqo+/aRThPCaDUUKCLGa4VUuy3eF
+          IXnBFLwGxiircABvcNRxFQUg4ZjUPUu1bHkj1uJJ2WgFrHu+txUY4SVfJnOU53M7jQZgi7jt9n92
+          WWBmu+nY6TLtK8lkDqmWeny2VHxllaFXSLdQeUxbB+MgsB9gEeZF4IUWYBtuKB+nDkEJ6gyHni3u
+          9oGvXapT2RZZ/V8RfjjtM/5/oRpMcQUMfJDtrNR6eIoZHeyYWfqM3pCBZa5fhfk8ntIVMZl8nmh8
+          pHbW17dn4UOObia2eN6vBCczbGy1UjlgOUAK6dHhAseyqWQynYqmxw+MdBxCr6sRemR47hgqASfv
+          OnsxqhxlO01At68j1F+ydiXsEN7WEEN06klRxMO6h7kMljBNMDEwDQYJYIZIAWUDBAIBBQAEIPWw
+          rgHWfjTwT8lSrOtE6nzpdRDNm7WkvdBXXDW2qhisBBRfHHmhnCJ0iNerd8OGMTFd+b2n8wICJxA=
+          BLOK_B64
+
+      - name: Derle
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlokYardimcisi8-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Release olustur (APK dogrudan indirilebilir)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: s8-${{ github.run_number }}
+          name: Blok Yardimcisi 8 (build ${{ github.run_number }})
+          files: app/build/outputs/apk/debug/app-debug.apk
